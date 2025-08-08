@@ -16,7 +16,7 @@ LOCAL_API_SECRET = os.getenv("KITE_API_SECRET")
 REDIRECT_URL = "http://localhost:3000" # This must match your Redirect URL configured in Kite Connect app
 
 AWS_REGION = "ap-south-1" # Set your AWS region (e.g., ap-south-1 for Mumbai)
-SECRETS_MANAGER_SECRET_NAME = "KiteConnectBankNiftyData" # Choose a unique name for your secret
+SECRETS_MANAGER_SECRET_NAME = "KiteConnectBankniftyData" # Choose a unique name for your secret
 
 # --- AWS Secrets Manager Client ---
 # boto3 will automatically pick up AWS credentials from ~/.aws/credentials,
