@@ -62,6 +62,7 @@ def generate_access_token_and_update_secret(request_token):
     try:
         # Generate session using the request token and API secret
         data = kite.generate_session(request_token, api_secret=LOCAL_API_SECRET)
+        print(data)
         access_token = data["access_token"]
         # Store if needed, not strictly for KWS
 

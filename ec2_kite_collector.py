@@ -1,4 +1,4 @@
-
+#satyamsahu
 import os
 import datetime
 import pandas as pd
@@ -60,6 +60,8 @@ shutdown_event = threading.Event() # A flag to signal graceful shutdown across t
 kite = None 
 kws = None 
 
+instrument_mapping = {}
+
 # --- Function to fetch credentials from AWS Secrets Manager ---
 def get_kite_credentials():
     """
@@ -83,12 +85,55 @@ def get_kite_credentials():
         logging.error(f"Error retrieving Kite credentials from Secrets Manager: {e}", exc_info=True)
         return None
 
+def is_market_open():
+
+
+    now_ist = datetime.datetime.now(IST)
+    current_time = now_ist.time()
+
+    market_open_time = datetime.time(MARKET_OPEN_HOUR,MARKET_OPEN_MINUTE)
+    market_close_time = datetime.time(MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE)
+
+
+    is_open = market_open_time <= current_time <= market_close_time
+
+    is_weekday = now_ist.weekday() < 5
+
+
+    return is_open and is_weekday
+
+def is_eod_time():
+
+    now_ist = datetime.datetime.now(IST)
+    eod_time = datetime.time (EOD_PROCESSING_HOUR , EOD_PROCESSING_MINUTE)
+    current_time = now_ist.time()
+
+    return current_time > eod_time
+
+def calculate_days_to_expiry(expiry_date):
+
+    today = datetime.date.today()
+
+    if isinstance(expiry_date, datetime.date):
+        return(expiry_date - today).days
+    return 0
+
+
+
 def on_connect(ws, response):
-    """
-    Callback function executed when the WebSocket connection is established.
-    It subscribes to the desired Bank Nifty F&O instruments.
-    """
-    logging.info("Kite WebSocket connected. Attempting to subscribe to instruments...")
+    
+
+
+    if not is_market_open():
+        logging.warning("Market is currently closed. Skipping instrument subscription .")
+        logging.info(f"Current time : {datetime.datetime.now(IST).strftime('%H:%M:%S')}")
+        logging.info(f"Market hours : {MARKET_OPEN_HOUR:02d}:{MARKET_OPEN_MINUTE:02d} to {MARKET_CLOSE_HOUR:02d}:{MARKET_CLOSE_MINUTE:02d}")
+        return
+    
+    logging.info("Kite WebSocket connected. Market is open .Attempting to subscribe to instruments...")
+    
+    global instrument_mapping
+
     try:  
         # Fetch all F&O instruments from Kite Connect
         instruments = kite.instruments("NFO") 
@@ -98,6 +143,20 @@ def on_connect(ws, response):
         logging.info(f"Total NFO instruments fetched: {len(instruments)}")
         logging.info(f"Current date: {today_date}")
         
+        logging.info("Building instrument mapping dictionary...")
+        for instrument in instruments:
+            if instrument.get('name') == 'BANKNIFTY':
+                instrument_mapping[instrument['instrument_token']] = {
+
+                    'trading_symbol': instrument.get('tradingsymbol', ''),
+                    'instrument_type': instrument.get('instrument_type', ''),
+                    'strike': instrument.get('strike', 0),
+                    'expiry': instrument.get('expiry'),
+                    'exchange': instrument.get('exchange', ''),
+                    'name': instrument.get('name', ''),
+                    'days_to_expiry': calculate_days_to_expiry(instrument.get('expiry')) if instrument.get('expiry') else 0
+                }
+
         # --- Enhanced Diagnostic Block ---
         logging.info("--- Enhanced Diagnostic: BANKNIFTY instruments ---")
         futures_found = []
@@ -129,22 +188,30 @@ def on_connect(ws, response):
         # --- IMPROVED FUTURES FILTERING ---
         logging.info("=== FUTURES FILTERING ===")
         
-        # Sort futures by expiry to get nearest contracts
-        futures_found.sort(key=lambda x: x['expiry'])
         
-        if futures_found:
-            # Add the first (nearest expiry) future
-            nearest_future = futures_found[0]
+
+        monthly_futures = []
+
+        for fut in futures_found:
+
+            monthly_futures.append(fut)
+
+        monthly_futures.sort(key=lambda x : x['expiry'])
+
+        if monthly_futures:
+
+            nearest_future = monthly_futures[0]
             banknifty_futures_options_tokens.append(nearest_future['instrument_token'])
-            logging.info(f"✓ Added nearest Future: {nearest_future['tradingsymbol']} (Expiry: {nearest_future['expiry']})")
-            
-            # Add next month future if available
-            if len(futures_found) > 1:
-                next_future = futures_found[1]
+            logging.info(f"✓ Added nearest Monthly Future: {nearest_future['tradingsymbol']} (Expiry: {nearest_future['expiry']})")
+
+            if len(monthly_futures) > 1:
+                next_future = monthly_futures[1]
                 banknifty_futures_options_tokens.append(next_future['instrument_token'])
-                logging.info(f"✓ Added next Future: {next_future['tradingsymbol']} (Expiry: {next_future['expiry']})")
+                logging.info(f" Added next Monthly Future: {next_future['tradingsymbol']} (Expiry: {next_future['expiry']})")
+                
         else:
-            logging.warning("❌ No futures found after enhanced filtering")
+            logging.warning(" No monthly futures found")
+
 
         # --- GET ATM PRICE ---
         logging.info("=== FETCHING ATM PRICE ===")
@@ -157,7 +224,7 @@ def on_connect(ws, response):
                     ltp_data = kite.ltp([symbol])
                     spot_price = ltp_data[symbol]["last_price"]
                     atm_price_rough = round(spot_price / 100) * 100
-                    logging.info(f"✓ Fetched {symbol}: {spot_price}, ATM: {atm_price_rough}")
+                    logging.info(f"Fetched {symbol}: {spot_price}, ATM: {atm_price_rough}")
                     break
                 except Exception as e:
                     logging.warning(f"Failed {symbol}: {e}")
@@ -183,10 +250,13 @@ def on_connect(ws, response):
         target_date_min = today_date + datetime.timedelta(days=1)  # Tomorrow
         target_date_max = today_date + datetime.timedelta(days=14)  # Two weeks
         
-        weekly_options_added = 0
+        # Strategy 2: If insufficient weekly options, add monthly options
+        monthly_options_added = 0
+        monthly_min = today_date + datetime.timedelta(days=7)  # At least a week out
+        monthly_max = today_date + datetime.timedelta(days=45)
         for expiry, options_list in options_by_expiry.items():
-            if target_date_min <= expiry <= target_date_max:
-                logging.info(f"Checking expiry {expiry} ({len(options_list)} options)")
+            if monthly_min <= expiry <= monthly_max:
+                logging.info(f"Processing monthly options for expiry {expiry} ({len(options_list)} options)")
                 
                 options_for_this_expiry = 0
                 for opt in options_list:
@@ -194,56 +264,27 @@ def on_connect(ws, response):
                         banknifty_futures_options_tokens.append(opt['instrument_token'])
                         options_for_this_expiry += 1
                         if options_for_this_expiry <= 5:  # Log first few
-                            logging.info(f"  ✓ Added: {opt['tradingsymbol']} (Strike: {opt['strike']})")
+                            logging.info(f"  ✓ Added: {opt['tradingsymbol']} (Strike: {opt['strike']}, Days to expiry: {calculate_days_to_expiry(opt['expiry'])})")
                 
                 if options_for_this_expiry > 5:
                     logging.info(f"  ✓ Added {options_for_this_expiry - 5} more options for expiry {expiry}")
                 
-                weekly_options_added += options_for_this_expiry
+                monthly_options_added += options_for_this_expiry
                 
                 # Limit to avoid too many subscriptions
-                if weekly_options_added >= 100:
-                    logging.info(f"Reached weekly options limit (100), stopping at expiry {expiry}")
+                if monthly_options_added >= 150:
+                    logging.info(f"Reached monthly options limit (150), stopping at expiry {expiry}")
                     break
-        
-        logging.info(f"Total weekly/near-term options added: {weekly_options_added}")
-        
-        # Strategy 2: If insufficient weekly options, add monthly options
-        monthly_options_added = 0
-        if weekly_options_added < 20:  # If we have fewer than 20 options, add monthly
-            logging.info("Adding monthly options as supplement...")
-            
-            # Find expiries 15-45 days out (monthly contracts)
-            monthly_min = today_date + datetime.timedelta(days=15)
-            monthly_max = today_date + datetime.timedelta(days=45)
-            
-            for expiry, options_list in options_by_expiry.items():
-                if monthly_min <= expiry <= monthly_max:
-                    logging.info(f"Adding monthly options for expiry {expiry}")
-                    
-                    # Be more selective for monthly - closer to ATM
-                    monthly_min_strike = atm_price_rough - 1000
-                    monthly_max_strike = atm_price_rough + 1000
-                    
-                    for opt in options_list:
-                        if monthly_min_strike <= opt['strike'] <= monthly_max_strike:
-                            banknifty_futures_options_tokens.append(opt['instrument_token'])
-                            monthly_options_added += 1
-                            if monthly_options_added <= 10:  # Log first few monthly
-                                logging.info(f"  ✓ Monthly: {opt['tradingsymbol']} (Strike: {opt['strike']})")
-                    
-                    if monthly_options_added >= 50:  # Limit monthly options
-                        break
         
         logging.info(f"Total monthly options added: {monthly_options_added}")
 
         # --- FINAL FALLBACK ---
         total_instruments = len(banknifty_futures_options_tokens)
-        logging.info(f"=== SUMMARY ===")
+        logging.info(f"=== SUBSCRIPTION SUMMARY ===")
         logging.info(f"Total instruments selected: {total_instruments}")
         
         if total_instruments == 0:
-            logging.warning("No instruments found with normal logic, using emergency fallback...")
+            logging.warning("⚠️ No instruments found with normal logic, using emergency fallback...")
             
             # Emergency fallback: Add any BANKNIFTY instruments available
             fallback_count = 0
@@ -260,38 +301,48 @@ def on_connect(ws, response):
         
         # --- SUBSCRIPTION ---
         if banknifty_futures_options_tokens:
-            logging.info(f"Proceeding to subscribe to {len(banknifty_futures_options_tokens)} instruments")
+            logging.info(f" Proceeding to subscribe to {len(banknifty_futures_options_tokens)} instruments")
             
             # Subscribe in batches
-            batch_size = 200  # Reduced batch size for stability
+            batch_size = 200  # Batch size for stability
             for i in range(0, len(banknifty_futures_options_tokens), batch_size):
                 batch = banknifty_futures_options_tokens[i:i + batch_size]
                 ws.subscribe(batch)
                 ws.set_mode(ws.MODE_FULL, batch)
-                logging.info(f"Subscribed to batch {i//batch_size + 1}: {len(batch)} instruments")
+                logging.info(f" Subscribed to batch {i//batch_size + 1}: {len(batch)} instruments")
                 time.sleep(0.2)  # Small delay between batches
             
-            logging.info(f"✅ Successfully subscribed to {len(banknifty_futures_options_tokens)} instruments")
+            logging.info(f" Successfully subscribed to {len(banknifty_futures_options_tokens)} instruments")
         else:
-            logging.error("❌ No instruments to subscribe to!")
+            logging.error(" No instruments to subscribe to!")
         
     except Exception as e:
-        logging.error(f"❌ Error in on_connect: {e}", exc_info=True)
+        logging.error(f" Error in on_connect: {e}", exc_info=True)
         ws.stop()
+        
 def on_ticks(ws, ticks):
-    """
-    Callback function executed when new market data ticks are received.
-    It processes and stores the ticks in memory.
-    """
-    # Record the local timestamp in IST when ticks are received
+    
     timestamp = datetime.datetime.now(IST) 
-    with data_lock: # Use lock for thread-safe access to the shared list
+    with data_lock: 
         for tick in ticks:
             # Extract relevant data points from the tick object
             # Tick structure reference: https://kite.trade/docs/connect/v3/websocket/#market-data
+            instrument_token = tick.get('instrument_token')
+            instrument_details = instrument_mapping.get(instrument_token, {})
+            
+            # Extract relevant data points from the tick object and add instrument details
             processed_tick = {
                 'timestamp': timestamp,
-                'instrument_token': tick.get('instrument_token'),
+                'instrument_token': instrument_token,
+                # ADDED: Include instrument details in each tick
+                'trading_symbol': instrument_details.get('trading_symbol', ''),
+                'instrument_type': instrument_details.get('instrument_type', ''),
+                'strike': instrument_details.get('strike', 0),
+                'expiry': instrument_details.get('expiry'),
+                'days_to_expiry': instrument_details.get('days_to_expiry', 0),
+                'exchange': instrument_details.get('exchange', ''),
+                'name': instrument_details.get('name', ''),
+                # Market data
                 'last_price': tick.get('last_price'),
                 'ohlc_open': tick.get('ohlc', {}).get('open'), 
                 'ohlc_high': tick.get('ohlc', {}).get('high'),
@@ -304,7 +355,8 @@ def on_ticks(ws, ticks):
                 'depth_sell': json.dumps(tick.get('depth', {}).get('sell', []))
             }
             in_memory_ticks.append(processed_tick)
-    # logging.debug(f"Received {len(ticks)} ticks. Total in memory: {len(in_memory_ticks)}") # Use debug for high volume logs
+             
+    #logging.debug(f"Received {len(ticks)} ticks. Total in memory: {len(in_memory_ticks)}") # Use debug for high volume logs
 
 def on_close(ws, code, reason):
     """Callback function executed when the WebSocket connection is closed."""
@@ -361,16 +413,11 @@ def save_periodic_data():
 # --- End-of-Day (EOD) Processing and Parquet Conversion ---
 def process_eod_data():
     """
-    Consolidates all temporary CSV files collected throughout the day,
-    performs data cleaning, and saves the consolidated data as a clean Parquet file.
-    Optionally uploads the Parquet file to AWS S3.
+    Memory-efficient EOD processing that handles large datasets in chunks.
+    Drop-in replacement for the original function.
     """
     logging.info("Starting End-of-Day data processing...")
-    all_day_data = []
-    # Get all temporary CSV files in the directory
-    temp_files = [f for f in os.listdir(TEMP_DATA_DIR) if f.endswith('.csv')]
-    temp_files.sort() # Process files in chronological order
-
+    
     # First, flush any remaining ticks from memory to ensure all data is captured
     remaining_ticks = []
     with data_lock:
@@ -385,66 +432,146 @@ def process_eod_data():
             # Save the last flush to a distinct temporary file
             remaining_filename = os.path.join(TEMP_DATA_DIR, f"ticks_last_flush_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv")
             df_remaining.to_csv(remaining_filename, index=False)
-            temp_files.append(os.path.basename(remaining_filename)) # Add this file to the list for processing
             logging.info(f"Saved remaining ticks to {remaining_filename}")
+            del df_remaining, remaining_ticks  # Free memory immediately
         except Exception as e:
             logging.error(f"Error saving remaining in-memory ticks for EOD: {e}", exc_info=True)
 
-    # Re-scan temp files to ensure the last flushed file is included
+    # Scan temp files to process final 
     temp_files = [f for f in os.listdir(TEMP_DATA_DIR) if f.endswith('.csv')]
     temp_files.sort()
 
-    # Load all temporary CSV files into a list of DataFrames
-    for fname in temp_files:
-        filepath = os.path.join(TEMP_DATA_DIR, fname)
-        try:
-            df = pd.read_csv(filepath)
-            all_day_data.append(df)
-            os.remove(filepath) # Clean up temporary file after reading
-            logging.debug(f"Processed and removed temporary file: {filepath}")
-        except Exception as e:
-            logging.error(f"Error reading or deleting temporary file {filepath}: {e}", exc_info=True)
+    if not temp_files:
+        logging.info("No data frames to consolidate for End-of-Day processing.")
+        return
 
-    if all_day_data:
-        # Concatenate all DataFrames into one master DataFrame for the day
-        consolidated_df = pd.concat(all_day_data, ignore_index=True)
-        logging.info(f"Consolidated {len(consolidated_df)} total ticks from temporary files.")
-
-        # --- Data Cleaning and Type Conversion ---
-        # Convert timestamp column to datetime objects and localize to IST
-        consolidated_df['timestamp'] = pd.to_datetime(consolidated_df['timestamp'])
-        consolidated_df['timestamp'] = consolidated_df['timestamp'].dt.tz_convert(IST)
-        # Sort data by timestamp and instrument token for chronological order
-        consolidated_df.sort_values(by=['timestamp', 'instrument_token'], inplace=True)
-        # Remove any potential duplicate ticks (e.g., from reconnections or re-processing)
-        consolidated_df.drop_duplicates(inplace=True) 
-        logging.info(f"Cleaned data, total unique ticks: {len(consolidated_df)}")
-
-        # Convert numeric columns to appropriate types, handling potential errors and NaNs
-        for col in ['last_price', 'ohlc_open', 'ohlc_high', 'ohlc_low', 'ohlc_close', 'volume', 'oi']:
-            if col in consolidated_df.columns:
-                # Use errors='coerce' to turn unparseable values into NaN, then fill NaN with 0
-                consolidated_df[col] = pd.to_numeric(consolidated_df[col], errors='coerce').fillna(0) 
-        if 'instrument_token' in consolidated_df.columns:
-            consolidated_df['instrument_token'] = consolidated_df['instrument_token'].astype('int64')
-
-        # --- Save to Parquet File ---
-        # Generate a daily-based filename for the Parquet file
-        eod_filename = os.path.join(FINAL_DATA_DIR, f"banknifty_fo_data_{datetime.date.today().strftime('%Y%m%d')}.parquet")
-        try:
-            # Save the DataFrame to a Parquet file for efficient storage and querying
-            consolidated_df.to_parquet(eod_filename, index=False, engine='pyarrow')
+    logging.info(f"Found {len(temp_files)} temporary files to process")
+    
+    # Generate a daily-based filename for the Parquet file
+    eod_filename = os.path.join(FINAL_DATA_DIR, f"banknifty_fo_data_{datetime.date.today().strftime('%Y%m%d')}.parquet")
+    
+    try:
+        # Process files in chunks to avoid memory overload
+        CHUNK_SIZE = 15  # Process 15 files at a time (adjust based on your system)
+        total_rows_processed = 0
+        
+        # Create a temporary parquet writer for efficient chunk-by-chunk writing
+        writer = None
+        schema = None
+        
+        for i in range(0, len(temp_files), CHUNK_SIZE):
+            chunk_files = temp_files[i:i + CHUNK_SIZE]
+            chunk_num = i//CHUNK_SIZE + 1
+            total_chunks = (len(temp_files) - 1) // CHUNK_SIZE + 1
+            
+            logging.info(f"Processing chunk {chunk_num}/{total_chunks}: {len(chunk_files)} files")
+            
+            # Load this chunk of files
+            chunk_data = []
+            chunk_rows = 0
+            
+            for fname in chunk_files:
+                filepath = os.path.join(TEMP_DATA_DIR, fname)
+                try:
+                    df = pd.read_csv(filepath)
+                    chunk_data.append(df)
+                    chunk_rows += len(df)
+                    logging.debug(f"Loaded {fname}: {len(df)} rows")
+                except Exception as e:
+                    logging.error(f"Error reading temporary file {filepath}: {e}", exc_info=True)
+                    continue
+            
+            if not chunk_data:
+                logging.warning(f"No valid data in chunk {chunk_num}")
+                continue
+            
+            # Process this chunk
+            try:
+                # Concatenate chunk data
+                logging.info(f"Consolidating chunk {chunk_num}: {chunk_rows} rows")
+                chunk_df = pd.concat(chunk_data, ignore_index=True)
+                del chunk_data  # Free memory immediately
+                
+                # --- Data Cleaning and Type Conversion for this chunk ---
+                logging.info(f"Cleaning chunk {chunk_num} data...")
+                
+                # Convert timestamp column to datetime objects and localize to IST
+                chunk_df['timestamp'] = pd.to_datetime(chunk_df['timestamp'])
+                if chunk_df['timestamp'].dt.tz is not None:
+                    chunk_df['timestamp'] = chunk_df['timestamp'].dt.tz_convert(IST)
+                else:
+                    chunk_df['timestamp'] = chunk_df['timestamp'].dt.tz_localize(IST)
+                
+                # Sort data by timestamp and instrument token for chronological order
+                chunk_df.sort_values(by=['timestamp', 'instrument_token'], inplace=True)
+                
+                # Remove any potential duplicate ticks within this chunk
+                before_dedup = len(chunk_df)
+                chunk_df.drop_duplicates(inplace=True)
+                after_dedup = len(chunk_df)
+                if before_dedup != after_dedup:
+                    logging.info(f"Removed {before_dedup - after_dedup} duplicates from chunk {chunk_num}")
+                
+                # Convert numeric columns to appropriate types, handling potential errors and NaNs
+                numeric_columns = ['last_price', 'ohlc_open', 'ohlc_high', 'ohlc_low', 'ohlc_close', 'volume', 'oi', 'strike']
+                for col in numeric_columns:
+                    if col in chunk_df.columns:
+                        chunk_df[col] = pd.to_numeric(chunk_df[col], errors='coerce').fillna(0)
+                
+                if 'instrument_token' in chunk_df.columns:
+                    chunk_df['instrument_token'] = chunk_df['instrument_token'].astype('int64')
+                
+                # ADDED: Convert days_to_expiry to integer
+                if 'days_to_expiry' in chunk_df.columns:
+                    chunk_df['days_to_expiry'] = pd.to_numeric(chunk_df['days_to_expiry'], errors='coerce').fillna(0).astype('int32')
+                
+                logging.info(f" Chunk {chunk_num} cleaned: {len(chunk_df)} unique rows")
+                total_rows_processed += len(chunk_df)
+                
+                # Convert to PyArrow table for efficient writing
+                table = pa.Table.from_pandas(chunk_df)
+                
+                # Initialize writer with first chunk's schema
+                if writer is None:
+                    schema = table.schema
+                    writer = pq.ParquetWriter(eod_filename, schema)
+                    logging.info(f"Initialized Parquet writer for: {eod_filename}")
+                
+                # Write this chunk to the parquet file
+                writer.write_table(table)
+                logging.info(f"Written chunk {chunk_num} to parquet. Total rows so far: {total_rows_processed}")
+                
+                # Free memory
+                del chunk_df, table
+                
+            except Exception as e:
+                logging.error(f"Error processing chunk {chunk_num}: {e}", exc_info=True)
+                continue
+        
+        # Close the parquet writer
+        if writer:
+            writer.close()
             logging.info(f"Daily Parquet file saved locally: {eod_filename}")
-
+            logging.info(f"Total unique rows processed: {total_rows_processed}")
+            
             # --- Upload to S3 (if enabled) ---
             if SAVE_TO_S3:
                 upload_to_s3(eod_filename, S3_BUCKET_NAME, S3_PREFIX)
-
-        except Exception as e:
-            logging.error(f"Error saving Parquet file or uploading to S3: {e}", exc_info=True)
-    else:
-        logging.info("No data frames to consolidate for End-of-Day processing.")
-
+                
+            logging.info("EOD processing completed successfully!")
+            
+        else:
+            logging.error("No data was successfully processed - Parquet file not created")
+            
+    except Exception as e:
+        logging.error(f"Error saving Parquet file or uploading to S3: {e}", exc_info=True)
+        # Clean up partial parquet file if it exists
+        if os.path.exists(eod_filename):
+            try:
+                os.remove(eod_filename)
+                logging.info(f"Cleaned up partial parquet file: {eod_filename}")
+            except:
+                pass
 def upload_to_s3(local_filepath, bucket_name, s3_prefix=""):
     """
     Uploads a local file to a specified AWS S3 bucket.
@@ -456,7 +583,7 @@ def upload_to_s3(local_filepath, bucket_name, s3_prefix=""):
         s3_client.upload_file(local_filepath, bucket_name, object_name)
         logging.info(f"Successfully uploaded {local_filepath} to s3://{bucket_name}/{object_name}")
         # Optionally, remove the local file after successful upload to save disk space on EC2
-        os.remove(local_filepath) 
+        
         logging.info(f"Removed local file: {local_filepath}")
     except Exception as e:
         logging.error(f"Error uploading {local_filepath} to S3: {e}", exc_info=True)
@@ -468,41 +595,127 @@ def market_session_manager():
     and triggers the End-of-Day processing at the specified market close time.
     """
     global kws # Access the global KiteTicker instance
+    logging.info(" Market session manager started")
+    
     while not shutdown_event.is_set(): # Keep running until a shutdown is signaled
         now_ist = datetime.datetime.now(IST)
 
-        # Log a warning if past market open but WebSocket is not connected
-        # This check is primarily to alert if connection fails during active market hours
-        if (not kws or not kws.is_connected()) and \
-           (now_ist.hour > MARKET_OPEN_HOUR or \
-           (now_ist.hour == MARKET_OPEN_HOUR and now_ist.minute >= MARKET_OPEN_MINUTE)) and \
-           (now_ist.hour < MARKET_CLOSE_HOUR or \
-           (now_ist.hour == MARKET_CLOSE_HOUR and now_ist.minute < MARKET_CLOSE_MINUTE)):
-            logging.warning(f"Market is open ({now_ist.strftime('%H:%M')}) but Kite WebSocket is not connected. This might indicate an issue with connection or reconnection.")
 
+        if now_ist.weekday() >= 5:
+            logging.info(f"Today is a weekend ({now_ist.strftime('%A')}). Market is closed.")
+            time.sleep(3600)
+            continue
 
-        # Check if it's time for End-of-Day processing
-        if now_ist.hour > EOD_PROCESSING_HOUR or \
-           (now_ist.hour == EOD_PROCESSING_HOUR and now_ist.minute >= EOD_PROCESSING_MINUTE):
-            if not shutdown_event.is_set(): # Ensure EOD is only triggered once
-                logging.info(f"EOD processing time detected ({now_ist.strftime('%H:%M')}). Stopping WebSocket and initiating data processing.")
+        market_is_open = is_market_open()
+        eod_time_reached = is_eod_time()
+    
+        if now_ist.minute % 15 == 0 and now_ist.second < 30:
+            if market_is_open:
+                logging.info(f"Market is open - Current time : {now_ist.strftime('%H:%M:%S')}")
                 if kws and kws.is_connected():
-                    kws.stop() # Disconnect WebSocket gracefully
+                    logging.info(f"Websocket is connected , data collection is active")
+                else:
+                    logging.warning(f"Websocket is not Connected during market hours!")
+            else:
+                logging.info(f"Market is close - Current time: {now_ist.strftime('%H:%M:%S')}")
+
+        if market_is_open:
+            if not kws or not kws.is_connected():
+                logging.warning(f" Market is open ({now_ist.strftime('%H:%M')}) but Kite WebSocket is not connected.")
+                logging.warning("This might indicate a connection issue that needs attention.")
+        
+        # MODIFIED: Enhanced EOD processing trigger
+        if eod_time_reached:
+            if not shutdown_event.is_set(): # Ensure EOD is only triggered once
+                logging.info(f" EOD processing time detected ({now_ist.strftime('%H:%M')})")
+                logging.info(" Initiating End-of-Day data processing sequence...")
+                
+                # Gracefully disconnect WebSocket if connected
+                if kws and kws.is_connected():
+                    logging.info(" Disconnecting WebSocket for EOD processing...")
+                    
+                    kws.stop()
+                
                 shutdown_event.set() # Signal all other threads to prepare for shutdown
                 break # Exit the market_session_manager loop
             else:
                 logging.debug("EOD processing already triggered. Waiting for application shutdown.")
-
-        # Sleep until the next minute mark or for a short interval
-        time_to_sleep = (60 - now_ist.second) % 60
-        if time_to_sleep == 0: time_to_sleep = 60 # Ensure we sleep at least a minute if currently at 0 second
-        time.sleep(time_to_sleep)
+        
+        # ADDED: Different sleep intervals based on market status
+        if market_is_open:
+            # During market hours, check more frequently
+            time.sleep(30)  # Check every 30 seconds during market hours
+        else:
+            # Outside market hours, check less frequently
+            time.sleep(300)  # Check every 5 minutes outside market hours
+def wait_for_market_open():
+   
+    while True:
+        now_ist = datetime.datetime.now(IST)
+        
+        # Check if it's a weekend
+        if now_ist.weekday() >= 5:  # Saturday=5, Sunday=6
+            # Calculate time until next Monday
+            days_until_monday = 7 - now_ist.weekday()
+            monday_morning = now_ist.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=days_until_monday)
+            time_until_monday = (monday_morning - now_ist).total_seconds()
+            
+            logging.info(f"Weekend detected. Market will open on {monday_morning.strftime('%A %Y-%m-%d at %H:%M')}")
+            logging.info(f"Sleeping for {time_until_monday/3600:.1f} hours until market opens")
+            
+            # Sleep in chunks to allow for graceful shutdown
+            while time_until_monday > 0 and not shutdown_event.is_set():
+                sleep_time = min(3600, time_until_monday)  # Sleep max 1 hour at a time
+                time.sleep(sleep_time)
+                time_until_monday -= sleep_time
+            continue
+        
+        # Check if market is open
+        if is_market_open():
+            logging.info(f"Market is now open! Current time: {now_ist.strftime('%H:%M:%S')}")
+            break
+        else:
+            # Market is closed, calculate time until market opens
+            current_time = now_ist.time()
+            market_open_time = datetime.time(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE)
+            
+            if current_time < market_open_time:
+                # Market hasn't opened yet today
+                market_open_today = now_ist.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+                time_until_open = (market_open_today - now_ist).total_seconds()
+                
+                logging.info(f" Market opens at {market_open_time.strftime('%H:%M')}. Waiting {time_until_open/60:.0f} minutes...")
+            else:
+                # Market has closed for today, wait until tomorrow
+                tomorrow_open = now_ist.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0) + datetime.timedelta(days=1)
+                time_until_open = (tomorrow_open - now_ist).total_seconds()
+                
+                logging.info(f"Market closed for today. Opens tomorrow at {tomorrow_open.strftime('%H:%M')}. Waiting {time_until_open/3600:.1f} hours...")
+            
+            # Sleep in chunks to allow for graceful shutdown
+            while time_until_open > 0 and not shutdown_event.is_set():
+                sleep_time = min(300, time_until_open)  # Sleep max 5 minutes at a time
+                time.sleep(sleep_time)
+                time_until_open -= sleep_time
 
 # --- Main Script Execution Block ---
 if __name__ == "__main__":
     logging.info("Starting Kite BankNifty F&O Data Collector Application...")
+    logging.info(f"Application started at: {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    
 
+    now_ist = datetime.datetime.now(IST)
+    if now_ist.weekday() >= 5:
+        logging.info(f"Today is {now_ist.strftime('%A')} - Weekend detected")
+    elif is_market_open():
+        logging.info(f"Market is currently OPEN")
+    elif is_eod_time():
+        logging.info(f"Market has closed, it's past EOD time")
+    else:
+        logging.info(f" Market is currently CLOSED")
+    
     # Step 1: Fetch credentials from AWS Secrets Manager
+    logging.info(" Fetching credentials from AWS Secrets Manager...")
     credentials = get_kite_credentials()
     if not credentials:
         logging.error("Failed to retrieve Kite credentials from Secrets Manager. Exiting application.")
@@ -536,28 +749,60 @@ if __name__ == "__main__":
         logging.error(f"Error initializing KiteConnect or KiteTicker with fetched credentials: {e}", exc_info=True)
         exit(1) # Exit if API client cannot be initialized
 
-    # Step 3: Start background threads (These must start BEFORE kws.connect())
+
+    # ADDED: Wait for market to open before starting data collection
+    logging.info(" Checking market status before starting data collection...")
     
-    # Thread for periodic data saving
-    periodic_saver_thread = threading.Thread(target=save_periodic_data, daemon=True)
-    periodic_saver_thread.start()
-    logging.info("Periodic data saver thread started.")
+    # If it's already past EOD time, just run EOD processing and exit
+    if is_eod_time():
+        logging.info("It's already past EOD time. Running EOD processing and exiting...")
+        try:
+            process_eod_data()
+            logging.info("EOD processing completed successfully.")
+        except Exception as e:
+            logging.error(f" Critical error during EOD processing: {e}", exc_info=True)
+        logging.info(" Application shutdown complete. Exiting.")
+        exit(0)
+    
+    # Wait for market to open if it's not open yet
+    wait_for_market_open()
+    
+    # Double-check that we should proceed (market might have closed while waiting)
+    if is_eod_time():
+        logging.info(" Market closed while waiting. Running EOD processing and exiting...")
+        try:
+            process_eod_data()
+            logging.info(" EOD processing completed successfully.")
+        except Exception as e:
+            logging.error(f"Critical error during EOD processing: {e}", exc_info=True)
+        logging.info(" Application shutdown complete. Exiting.")
+        exit(0)
+
+    # Step 3: Start background threads (These must start BEFORE kws.connect())
+    logging.info(" Starting background threads...")
 
     # Thread for managing market session times and triggering EOD
     session_manager_thread = threading.Thread(target=market_session_manager, daemon=True)
     session_manager_thread.start()
     logging.info("Market session manager thread started.")
 
+    # Thread for periodic data saving
+    periodic_saver_thread = threading.Thread(target=save_periodic_data, daemon=True)
+    periodic_saver_thread.start()
+    logging.info(" Periodic data saver thread started.")
+
     # Step 4: Connect Kite WebSocket in the main thread (this is blocking)
     # kws.connect() must be in the main thread to avoid 'signal only works in main thread' error
-    logging.info("Attempting to connect Kite WebSocket in the main thread...")
+    logging.info(" Attempting to connect Kite WebSocket in the main thread...")
+    logging.info(f" Connection attempt at: {datetime.datetime.now(IST).strftime('%H:%M:%S')}")
+    
     try:
         kws.connect() # This call blocks until the WebSocket disconnects or an unhandled error occurs
     except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt detected in main thread. Signaling for graceful shutdown.")
+        logging.info(" KeyboardInterrupt detected in main thread. Signaling for graceful shutdown.")
         shutdown_event.set() # Set the event to signal immediate shutdown if Ctrl+C is pressed
     except Exception as e:
-        logging.error(f"An unexpected error occurred during WebSocket connection: {e}", exc_info=True)
+        logging.error(f" An unexpected error occurred during WebSocket connection: {e}", exc_info=True)
         shutdown_event.set() # Signal shutdown on any unexpected error
 
     # Step 5: After kws.connect() returns (i.e., WebSocket closed), proceed to EOD processing
@@ -565,8 +810,16 @@ if __name__ == "__main__":
     shutdown_event.set() # Ensure all threads know to shut down before final processing
 
     # Give a small buffer for background threads to react to the shutdown_event
+    logging.info("Waiting for background threads to complete...")
     time.sleep(5) 
 
-    process_eod_data() # Perform End-of-Day data processing and saving
+    # Final EOD processing
+    try:
+        logging.info(" Starting final End-of-Day processing...")
+        process_eod_data()
+        logging.info(" EOD processing completed successfully.")
+    except Exception as e:
+        logging.error(f" Critical error during EOD processing: {e}", exc_info=True)
 
-    logging.info("Application shutdown complete. Exiting.")
+    logging.info(" Application shutdown complete. Exiting.")
+    #satyam
